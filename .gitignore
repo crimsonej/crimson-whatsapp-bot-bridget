@@ -1,6 +1,26 @@
+# Dependencies
 node_modules/
+package-lock.json
+
+# WhatsApp Web.js Session Data
 .wwebjs_auth/
 .wwebjs_cache/
+
+# Logs and PID files
 *.log
+*.pid
+bridge.log
+
+# Temporary and backup files
 *.bak
-package-lock.json
+*.swp
+*.tmp
+/tmp/
+
+# OS/IDE Files
+.DS_Store
+.vscode/
+
+# Sensitive Config
+.env
+config.json

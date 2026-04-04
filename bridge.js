@@ -38,6 +38,137 @@ client.on('message', async (message) => {
     const isGroup = message.from.includes('@g.us');
     let shouldProcess = true;
 
+    // Extract raw phone number for session tracking
+    let userPhone = message.from.replace('@c.us', '').replace('@g.us', '');
+    if (message.author) {
+        // Group message: author is the individual ID
+        userPhone = message.author.replace('@c.us', '');
+    }
+
+    // Helper to send all types of AI responses (text/media)
+    const handleAIResponse = async (response) => {
+        if (!response || !response.data) return;
+        const data = response.data;
+        const Media = MessageMedia; // Alias for compatibility with common snippets
+        
+        const sendMedia = async (filePath, key, filename) => {
+            if (!filePath) return;
+            try {
+                const absPath = path.resolve(filePath);
+                if (!fs.existsSync(absPath)) {
+                    console.error(`[${key}] File not found: ${absPath}`);
+                    return;
+                }
+
+                const stats = fs.statSync(absPath);
+                const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
+                console.log(`[MEDIA ${key}] Sending ${absPath} (${sizeMB} MB)`);
+
+                const media = await Media.fromFilePath(absPath);
+
+                // Use the desired realistic filename if provided
+                if (filename) {
+                    media.filename = filename;
+                }
+
+                // Set correct MIME types for WhatsApp compatibility
+                if (key === 'audio' && !media.mimetype?.startsWith('audio/')) {
+                    media.mimetype = 'audio/mpeg';
+                }
+                if (key === 'video' && !media.mimetype?.startsWith('video/')) {
+                    media.mimetype = 'video/mp4';
+                }
+
+                try {
+                    // Maximum WhatsApp limit typically allows up to ~64MB for inline media
+                    if (stats.size > 64 * 1024 * 1024) {
+                        console.log(`[MEDIA ${key}] Large file > 64MB, sending as document`);
+                        await client.sendMessage(message.from, media, { sendMediaAsDocument: true });
+                    } else {
+                        await client.sendMessage(message.from, media);
+                    }
+                } catch (e) {
+                    console.log(`[MEDIA ${key}] Inline send failed, trying as document...`);
+                    await client.sendMessage(message.from, media, { sendMediaAsDocument: true });
+                }
+
+                // Cleanup temp file
+                fs.unlink(absPath, (err) => { if (err) console.error(`[CLEANUP ${key}]`, err.message); });
+            } catch (err) { console.error(`[ERROR ${key}]`, err.message); }
+        };
+
+        if (data.audio) await sendMedia(data.audio, "audio", data.filename);
+        if (data.video) await sendMedia(data.video, "video", data.filename);
+        if (data.image) await sendMedia(data.image, "image", data.filename);
+
+        // Determine the target message for replies
+        let targetMessage = message;
+        if (data.reply_to_quoted && message.hasQuotedMsg) {
+            try {
+                targetMessage = await message.getQuotedMessage();
+            } catch (err) {
+                console.error("[ERROR] Failed to fetch quoted message for target:", err.message);
+            }
+        }
+
+        // 2. Send Sticker if present (direct base64 or file path)
+        if (data.sticker) {
+            try {
+                let stickerMedia;
+                if (fs.existsSync(data.sticker)) {
+                    stickerMedia = await Media.fromFilePath(data.sticker);
+                } else {
+                    stickerMedia = new Media('image/webp', data.sticker);
+                }
+                await targetMessage.reply(stickerMedia, null, { sendMediaAsSticker: true });
+            } catch (err) {
+                console.error('[ERROR Sticker Send]', err.message);
+            }
+        } 
+        // 3. Send text reply (fallback if no sticker)
+        else if (data.reply) {
+            await targetMessage.reply(data.reply).catch(e => console.error("[REPLY]", e.message));
+        }
+    };
+
+    // ----- Process Sticker Replies First -----
+    if (message.type === 'sticker' && (!message.body || !message.body.startsWith('/'))) {
+        let processSticker = false;
+        if (!isGroup) {
+            processSticker = true;
+        } else if (message.hasQuotedMsg) {
+            try {
+                const quoted = await message.getQuotedMessage();
+                const isIdMatch = (quoted.author === botId || quoted.from === botId);
+                const isPartIdMatch = botId && quoted.author && (quoted.author.split('@')[0] === botId.split('@')[0]);
+                if (quoted.fromMe || isIdMatch || isPartIdMatch) {
+                    processSticker = true;
+                }
+            } catch (err) {
+                console.error("[ERROR] Failed to fetch quoted message for sticker:", err.stack);
+            }
+        }
+
+        if (processSticker) {
+            const media = await message.downloadMedia();
+            if (media) {
+                try {
+                    const response = await axios.post(AI_SERVER, {
+                        sticker: true,
+                        sticker_data: media.data,
+                        sticker_mimetype: media.mimetype,
+                        sender: message.from,
+                        user_phone: userPhone
+                    });
+                    await handleAIResponse(response);
+                } catch (err) {
+                    console.log('Sticker analysis error:', err.message);
+                }
+            }
+        }
+        return; // Always return on stickers to avoid sending text payloads to AI
+    }
+
     // ----- Group filter: only process if addressed to bot or a command -----
     if (isGroup) {
         let isAddressed = false;
@@ -49,7 +180,7 @@ client.on('message', async (message) => {
         } else {
             // 3b. Check if message has text/caption for name/tag mentions
             if (message.body) {
-                const mentioned = message.mentionedIds && message.mentionedIds.includes(botId);
+                const mentioned = message.mentionedIds && message.mentionedIds.some(id => id.split('@')[0] === botId.split('@')[0]);
                 const nameMentioned = message.body.toLowerCase().includes(BOT_NAME.toLowerCase());
                 isAddressed = mentioned || nameMentioned;
             }
@@ -75,41 +206,7 @@ client.on('message', async (message) => {
 
     if (!shouldProcess) return;
 
-    // Extract raw phone number for session tracking
-    let userPhone = message.from.replace('@c.us', '').replace('@g.us', '');
-    if (message.author) {
-        // Group message: author is the individual ID
-        userPhone = message.author.replace('@c.us', '');
-    }
 
-    // Helper to send all types of AI responses (text/media)
-    const handleAIResponse = async (response) => {
-        if (!response || !response.data) return;
-        const data = response.data;
-        const Media = MessageMedia; // Alias for compatibility with common snippets
-        
-        const sendMedia = async (filePath, key) => {
-            if (!filePath) return;
-            try {
-                const absPath = path.resolve(filePath);
-                if (fs.existsSync(absPath)) {
-                    const media = await Media.fromFilePath(absPath);
-                    try {
-                        await client.sendMessage(message.from, media);
-                    } catch (e) {
-                        // Fallback as document for unsupported/large files
-                        await client.sendMessage(message.from, media, { sendMediaAsDocument: true });
-                    }
-                    fs.unlink(absPath, (err) => { if (err) console.error(`[CLEANUP ${key}]`, err.message); });
-                }
-            } catch (err) { console.error(`[ERROR ${key}]`, err.message); }
-        };
-
-        if (data.audio) await sendMedia(data.audio, "audio");
-        if (data.video) await sendMedia(data.video, "video");
-        if (data.image) await sendMedia(data.image, "image");
-        if (data.reply) await message.reply(data.reply).catch(e => console.error("[REPLY]", e.message));
-    };
 
     // ----- Process based on message type -----
 
@@ -218,25 +315,7 @@ client.on('message', async (message) => {
         }
     }
 
-    // 3. Sticker recognition (automatic)
-    if (message.type === 'sticker' && !message.body?.startsWith('/')) {
-        const media = await message.downloadMedia();
-        if (media) {
-            try {
-                const response = await axios.post(AI_SERVER, {
-                    sticker: true,
-                    sticker_data: media.data,
-                    sticker_mimetype: media.mimetype,
-                    sender: message.from,
-                    user_phone: userPhone
-                });
-                await handleAIResponse(response);
-            } catch (err) {
-                console.log('Sticker analysis error:', err.message);
-            }
-        }
-        return;
-    }
+
 
     // Capture quoted message text and media for automatic vision/other messages
     let quotedText = null;
